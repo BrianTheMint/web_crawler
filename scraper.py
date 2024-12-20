@@ -3,19 +3,33 @@ from bs4 import BeautifulSoup
 import argparse
 import urllib.parse
 import re
-import signal
-import sys
 import os
 from concurrent.futures import ThreadPoolExecutor, as_completed
-import subprocess
+import signal
+import sys
 
 output_files = []
+stop_flag = False
+
+def download_image(url, worker_id):
+    try:
+        response = requests.get(url, stream=True)
+        response.raise_for_status()
+        image_name = os.path.join(f"worker_{worker_id}_images", os.path.basename(url))
+        os.makedirs(os.path.dirname(image_name), exist_ok=True)
+        with open(image_name, 'wb') as image_file:
+            for chunk in response.iter_content(1024):
+                image_file.write(chunk)
+        print(f"Downloaded image: {url}")
+    except requests.RequestException as e:
+        print(f"Failed to download image {url}: {e}")
 
 def scrape(url, max_depth, current_depth=0, visited=None, worker_id=None):
+    global stop_flag
     if visited is None:
         visited = set()
     
-    if current_depth > max_depth or url in visited:
+    if current_depth > max_depth or url in visited or stop_flag:
         return
     
     visited.add(url)
@@ -30,6 +44,7 @@ def scrape(url, max_depth, current_depth=0, visited=None, worker_id=None):
     
     soup = BeautifulSoup(response.text, 'html.parser')
     links = [a.get('href') for a in soup.find_all('a', href=True)]
+    images = [img.get('src') for img in soup.find_all('img', src=True)]
     
     # Find non-hyperlinked URLs
     text = soup.get_text()
@@ -47,6 +62,10 @@ def scrape(url, max_depth, current_depth=0, visited=None, worker_id=None):
                     output_file_handle.write(absolute_link + '\n')
                 futures.append(executor.submit(scrape, absolute_link, max_depth, current_depth + 1, visited, worker_id))
         
+        for image in images:
+            absolute_image_url = urllib.parse.urljoin(url, image)
+            futures.append(executor.submit(download_image, absolute_image_url, worker_id))
+        
         for future in as_completed(futures):
             future.result()
 
@@ -57,40 +76,31 @@ def merge_output_files(output_file):
                 outfile.write(infile.read())
             os.remove(output_file_name)
 
-processes = []
-
 def signal_handler(sig, frame):
+    global stop_flag
     print("\nGracefully shutting down...")
-    for process in processes:
-        process.terminate()
-    for process in processes:
-        process.wait()
-    
-    # Kill all Python processes
-    os.system("pkill -f scraper.py")
-    sys.exit(0)
+    stop_flag = True
 
 if __name__ == "__main__":
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
     
-    parser = argparse.ArgumentParser(description="Web scraper manager")
+    parser = argparse.ArgumentParser(description="Web scraper")
     parser.add_argument("--url", required=True, help="The URL to scrape")
     parser.add_argument("--max_depth", type=int, required=True, help="The maximum depth to follow links")
     parser.add_argument("--output", default="found_urls.txt", help="The output file to write URLs to")
-    parser.add_argument("--workers", type=int, default=3, help="The number of worker instances to start")
+    parser.add_argument("--worker_id", type=int, required=True, help="The worker ID")
     
     args = parser.parse_args()
     
-    for worker_id in range(1, args.workers + 1):
-        process = subprocess.Popen([
-            sys.executable, 'scraper.py',
-            '--url', args.url,
-            '--max_depth', str(args.max_depth),
-            '--output', args.output,
-            '--worker_id', str(worker_id)
-        ])
-        processes.append(process)
-    
-    for process in processes:
-        process.wait()
+    if not args.url.startswith(('http://', 'https://')):
+        print("Error: URL must start with 'http://' or 'https://'")
+    else:
+        # Create an initial output file for the initial scrape
+        initial_output_file_name = f"worker_{args.worker_id}.txt"
+        output_files.append(initial_output_file_name)
+        with open(initial_output_file_name, 'w') as initial_output_file_handle:
+            scrape(args.url, args.max_depth, visited=set(), worker_id=args.worker_id)
+        
+        # Merge output files on shutdown
+        merge_output_files(args.output)
